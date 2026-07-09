@@ -36,12 +36,12 @@ package gateway
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -102,6 +102,15 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return rw.ResponseWriter.Write(b)
 }
 
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	writer *gzip.Writer
+}
+
+func (rw *gzipResponseWriter) Write(b []byte) (int, error) {
+	return rw.writer.Write(b)
+}
+
 // ---------------------------------------------------------------------------
 // MIDDLEWARE IMPLEMENTATIONS
 // ---------------------------------------------------------------------------
@@ -113,7 +122,7 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Printf("PANIC: %v\n%s", rec, debug.Stack())
-				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+				writeMiddlewareJSON(w, http.StatusInternalServerError, map[string]interface{}{
 					"error":   "internal_server_error",
 					"message": "An unexpected error occurred",
 				})
@@ -147,7 +156,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start)
 
 		log.Printf("[%s] %s %s %d %s %s",
-			getClientIP(r),
+			getMiddlewareClientIP(r),
 			r.Method,
 			r.URL.Path,
 			rw.statusCode,
@@ -205,7 +214,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractToken(r)
 		if token == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			writeMiddlewareJSON(w, http.StatusUnauthorized, map[string]interface{}{
 				"error":   "unauthorized",
 				"message": "Missing authentication token",
 			})
@@ -215,7 +224,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		// Validate token and extract user info
 		userID, sessionID, err := validateToken(token)
 		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			writeMiddlewareJSON(w, http.StatusUnauthorized, map[string]interface{}{
 				"error":   "invalid_token",
 				"message": err.Error(),
 			})
@@ -251,7 +260,7 @@ func RateLimitMiddleware(ratePerSecond float64, burst int) func(http.Handler) ht
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := getClientIP(r)
+			key := getMiddlewareClientIP(r)
 			if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
 				key = apiKey
 			}
@@ -276,9 +285,9 @@ func RateLimitMiddleware(ratePerSecond float64, burst int) func(http.Handler) ht
 			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset, 10))
 
 			if !allowed {
-				writeJSON(w, http.StatusTooManyRequests, map[string]interface{}{
-					"error":   "rate_limit_exceeded",
-					"message": "Too many requests. Please slow down.",
+				writeMiddlewareJSON(w, http.StatusTooManyRequests, map[string]interface{}{
+					"error":       "rate_limit_exceeded",
+					"message":     "Too many requests. Please slow down.",
 					"retry_after": reset - time.Now().Unix(),
 				})
 				return
@@ -364,20 +373,54 @@ func TimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
 // CompressMiddleware compresses responses using gzip if the client supports it.
 func CompressMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		if !acceptsGzip(r.Header.Get("Accept-Encoding")) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// TODO: Implement gzip response compression
-		next.ServeHTTP(w, r)
+
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		w.Header().Del("Content-Length")
+
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+
+		next.ServeHTTP(&gzipResponseWriter{
+			ResponseWriter: w,
+			writer:         gz,
+		}, r)
 	})
+}
+
+func acceptsGzip(acceptEncoding string) bool {
+	for _, encoding := range strings.Split(acceptEncoding, ",") {
+		parts := strings.Split(strings.TrimSpace(encoding), ";")
+		if len(parts) == 0 || !strings.EqualFold(strings.TrimSpace(parts[0]), "gzip") {
+			continue
+		}
+		if len(parts) == 1 {
+			return true
+		}
+		for _, parameter := range parts[1:] {
+			keyValue := strings.SplitN(strings.TrimSpace(parameter), "=", 2)
+			if len(keyValue) != 2 || !strings.EqualFold(strings.TrimSpace(keyValue[0]), "q") {
+				continue
+			}
+			quality, err := strconv.ParseFloat(strings.TrimSpace(keyValue[1]), 64)
+			if err == nil && quality <= 0 {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
 
-func getClientIP(r *http.Request) string {
+func getMiddlewareClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		return strings.TrimSpace(parts[0])
@@ -398,7 +441,7 @@ func generateUUID() string {
 	return hex.EncodeToString(b)
 }
 
-func generateAPIKey() string {
+func generateMiddlewareAPIKey() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return base64.URLEncoding.EncodeToString(b)
@@ -428,7 +471,7 @@ func validateToken(token string) (string, string, error) {
 	return "user_stub", "session_stub", nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+func writeMiddlewareJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
